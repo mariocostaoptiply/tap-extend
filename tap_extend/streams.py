@@ -5,6 +5,7 @@ Streams:
   - SupplierAgreementsStream:         GET /SupplierAgreement         (FULL_TABLE, active=true)
   - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (INCREMENTAL child of supplier_agreements)
   - ProductsStream:                   GET /Products                  (INCREMENTAL, first run unfiltered then modifiedDateFrom/modifiedDateTo)
+  - ProductsCreatedStream:            GET /Products + detail         (INCREMENTAL, unfiltered scan + local createDate window)
   - ProductAvailabilityStream:        GET /ProductAvailability       (INCREMENTAL, modifiedDateFrom)
   - CustomerOrdersStream:             first run via reports, then GET /CustomerOrders + detail
   - PurchaseOrdersStream:             GET /PurchaseOrders            (INCREMENTAL, createDateFrom)
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 _SIGNPOST_BOOKMARK_STREAMS = {
     "product_supplier_agreements": "changeDate",
     "products": "modifiedDate",
+    "products_created": "createDate",
     "customer_orders": "changeDate",
 }
 
@@ -1152,6 +1154,169 @@ class ProductsStream(ExtendStream):
             yield record
 
 
+class ProductsCreatedStream(ProductsStream):
+    """Recover newly created products missed by Extend's modified-date filter.
+
+    Every run scans the unfiltered Products list, then locally keeps products
+    created between the previous successful run (with a 24-hour overlap) and
+    the current tap-run upper bound. Product detail requests are only made for
+    retained products.
+
+    This is a temporary workaround for Extend not reliably populating
+    changedDate when a product is created.
+    """
+
+    name = "products_created"
+    replication_key = "createDate"
+    replication_method = "INCREMENTAL"
+    overlap = timedelta(hours=24)
+
+    @staticmethod
+    def _parse_create_date(value: Any) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        try:
+            parsed = datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            return None
+
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _creation_window(self, context: Optional[dict]) -> tuple[datetime, datetime]:
+        upper_bound = self._parse_create_date(self.sync_upper_bound)
+        if upper_bound is None:  # pragma: no cover - sync_upper_bound is generated internally
+            raise ValueError(f"Invalid products_created upper bound: {self.sync_upper_bound}")
+
+        current_state = self.get_context_state(context)
+        bookmark = None
+        if current_state.get("replication_key") == self.replication_key:
+            bookmark = self._parse_create_date(current_state.get("replication_key_value"))
+
+        if bookmark is not None and bookmark > upper_bound:
+            logger.warning(
+                "ProductsCreated: bookmark %s is after run upper bound %s; using upper bound.",
+                bookmark.isoformat(),
+                upper_bound.isoformat(),
+            )
+            bookmark = upper_bound
+
+        return (bookmark or upper_bound) - self.overlap, upper_bound
+
+    @staticmethod
+    def _map_list_record(product: dict[str, Any], product_number: str) -> dict[str, Any]:
+        groups = product.get("productGroupsAndCategories") or {}
+        if not isinstance(groups, dict):
+            groups = {}
+
+        return {
+            "productNumber": product_number,
+            "productName": product.get("productName"),
+            "createDate": product.get("createDate"),
+            "productUnit": product.get("productUnit"),
+            "cost": product.get("cost"),
+            "currency": product.get("currency"),
+            "countryOfOrigin": product.get("countryOfOrigin"),
+            "supplyMode": product.get("supplyMode"),
+            "manufacturer": product.get("manufacturer"),
+            "manufacturerProductNumber": product.get("manufacturerProductNumber"),
+            "gtinNumberList": product.get("gtinNumberList"),
+            "enabled": product.get("enabled"),
+            "statisticalCategory1": product.get("statisticalCategory1"),
+            "statisticalCategory2": product.get("statisticalCategory2"),
+            "statisticalCategory3": product.get("statisticalCategory3"),
+            "companyGroup": groups.get("companyGroup"),
+            "financialCategory": groups.get("financialCategory"),
+            "modifiedDate": product.get("modifiedDate"),
+        }
+
+    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        window_start, window_end = self._creation_window(context)
+        seen: dict[str, dict[str, Any]] = {}
+        stock_map: dict[str, list] = {}
+        page_offset = 0
+        page_count = 100
+        total_rows = 0
+        invalid_create_dates = 0
+
+        while True:
+            params: dict[str, Any] = {"pageCount": page_count, "pageOffset": page_offset}
+            try:
+                product_list = self._request(
+                    f"{self.base_url}/Products", params=params
+                ).json()
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 400 and page_offset > 0:
+                    logger.warning(
+                        "ProductsCreated: 400 at pageOffset=%d after %d rows / %d retained products. "
+                        "Yielding partial results. Response: %s",
+                        page_offset,
+                        total_rows,
+                        len(seen),
+                        exc.response.text[:500],
+                    )
+                    break
+                raise
+
+            if not isinstance(product_list, list) or not product_list:
+                break
+
+            total_rows += len(product_list)
+            for product in product_list:
+                created_at = self._parse_create_date(product.get("createDate"))
+                if created_at is None:
+                    invalid_create_dates += 1
+                    continue
+                if created_at < window_start or created_at > window_end:
+                    continue
+
+                product_number = str(product.get("productNumber") or "")
+                if not product_number:
+                    continue
+
+                stock_map.setdefault(product_number, []).append({
+                    "warehouse": product.get("warehouse") or "",
+                    "availableBalance": product.get("availableBalance") or 0,
+                })
+
+                if product_number not in seen:
+                    record = self._map_list_record(product, product_number)
+                    record.update(self._get_product_detail_fields(product_number))
+                    seen[product_number] = record
+
+            if len(product_list) < page_count:
+                break
+            page_offset += 1
+
+            if page_offset % 50 == 0:
+                logger.info(
+                    "ProductsCreated: page %d — %d rows scanned, %d products retained",
+                    page_offset,
+                    total_rows,
+                    len(seen),
+                )
+
+        logger.info(
+            "ProductsCreated: done — %d rows scanned, %d products retained, "
+            "%d rows skipped with invalid createDate; window=%s..%s",
+            total_rows,
+            len(seen),
+            invalid_create_dates,
+            window_start.isoformat(),
+            window_end.isoformat(),
+        )
+
+        for product_number, record in seen.items():
+            record["warehouse_stock"] = json.dumps(stock_map.get(product_number, []))
+            yield record
+
+
 # ---------------------------------------------------------------------------
 # ProductAvailabilityStream  —  GET /ProductAvailability
 # ---------------------------------------------------------------------------
@@ -1912,7 +2077,9 @@ def _report_state_date_range(stream: "ExtendStream") -> tuple[Optional[str], Opt
 
     bookmarks = tap_state.get("bookmarks", {})
     if isinstance(bookmarks, dict):
-        candidates.append(bookmarks.get(stream.name))
+        stream_bookmark = bookmarks.get(stream.name)
+        if isinstance(stream_bookmark, dict):
+            candidates.append(stream_bookmark)
 
     for candidate in candidates:
         if not isinstance(candidate, dict):

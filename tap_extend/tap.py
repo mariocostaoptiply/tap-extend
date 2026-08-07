@@ -12,6 +12,7 @@ from tap_extend.streams import (
     CustomerOrdersStream,
     ProductAvailabilityStream,
     ProductSupplierAgreementsStream,
+    ProductsCreatedStream,
     ProductsStream,
     PurchaseOrdersStream,
     ReportsOrderHeadersStream,
@@ -48,6 +49,7 @@ class TapExtend(Tap):
       - supplier_agreements           FULL_TABLE  GET /SupplierAgreement (active=true)
       - product_supplier_agreements   INCREMENTAL GET /ProductSupplierAgreements (child of supplier_agreements)
       - products                      INCREMENTAL GET /Products (first run unfiltered, then modifiedDateFrom/modifiedDateTo)
+      - products_created              INCREMENTAL GET /Products (unfiltered scan, local createDate window + detail)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
       - customer_orders               INCREMENTAL after bookmark exists via GET /CustomerOrders + detail (modifiedDateFrom/modifiedDateTo)
       - purchase_orders               INCREMENTAL GET /PurchaseOrders (createDateFrom)
@@ -208,6 +210,7 @@ class TapExtend(Tap):
             SupplierAgreementsStream(tap=self),
             ProductSupplierAgreementsStream(tap=self),
             ProductsStream(tap=self),
+            ProductsCreatedStream(tap=self),
             ProductAvailabilityStream(tap=self),
             CustomerOrdersStream(tap=self),
             PurchaseOrdersStream(tap=self),

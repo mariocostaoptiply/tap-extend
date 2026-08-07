@@ -55,10 +55,10 @@ def install_hotglue_sdk_stubs():
     ]:
         setattr(typing, name, type(name, (), {}))
 
-    typing.Property = Property
-    typing.PropertiesList = PropertiesList
-    streams.Stream = Stream
-    sdk.typing = typing
+    setattr(typing, "Property", Property)
+    setattr(typing, "PropertiesList", PropertiesList)
+    setattr(streams, "Stream", Stream)
+    setattr(sdk, "typing", typing)
 
     sys.modules["hotglue_singer_sdk"] = sdk
     sys.modules["hotglue_singer_sdk.typing"] = typing
@@ -814,7 +814,7 @@ def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
         "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/PurchaseOrders",
         "params": {
             "changeDateFrom": "2026-04-20T00:00:00",
-            "changeDateTo": "2026-04-20T17:18:46",
+            "changeDateTo": "2026-04-21T17:18:46",
             "pageNumber": 1,
         },
     }]
@@ -1328,6 +1328,8 @@ def test_products_first_run_ignores_start_date_until_bookmark_exists(monkeypatch
 
         class Response:
             def json(self):
+                if url.endswith("/Products/SKU-1"):
+                    return {"productData": {}}
                 return [{
                     "productNumber": "SKU-1",
                     "productName": "Product Example",
@@ -1357,13 +1359,19 @@ def test_products_first_run_ignores_start_date_until_bookmark_exists(monkeypatch
     records = list(stream.get_records())
     stream.finalize_state_progress_markers()
 
-    assert captured == [{
-        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products",
-        "params": {
-            "pageCount": 100,
-            "pageOffset": 0,
+    assert captured == [
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products",
+            "params": {
+                "pageCount": 100,
+                "pageOffset": 0,
+            },
         },
-    }]
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products/SKU-1",
+            "params": {},
+        },
+    ]
     assert records == [{
         "productNumber": "SKU-1",
         "productName": "Product Example",
@@ -1383,6 +1391,11 @@ def test_products_first_run_ignores_start_date_until_bookmark_exists(monkeypatch
         "companyGroup": "Group",
         "financialCategory": "Cat",
         "modifiedDate": None,
+        "annulled": None,
+        "productHandlings": None,
+        "assortmentCategory": None,
+        "productVisibility": None,
+        "detailChangedDate": None,
         "warehouse_stock": '[{"warehouse": "WH1", "availableBalance": 5}]',
     }]
     assert stream.stream_state["replication_key"] == "modifiedDate"
@@ -1434,6 +1447,141 @@ def test_products_subsequent_run_uses_bookmark_window(monkeypatch):
     }]
     assert stream.stream_state["replication_key"] == "modifiedDate"
     assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
+
+
+def test_products_created_first_run_filters_before_detail_and_advances_state(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-08-06T12:00:00+00:00"
+        state = {"bookmarks": {"products_created": {}}}
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    calls = []
+
+    def fake_request(url, params=None):
+        calls.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                if url.endswith("/Products/SKU-NEW"):
+                    return {
+                        "productData": {
+                            "annulled": False,
+                            "productVisibility": "AlwaysVisible",
+                            "productServices": {"productHandlings": ["Standard"]},
+                            "productGroupsAndCategories": {"assortmentCategory": "SALE"},
+                            "productDates": {"changedDate": "2026-08-06T10:55:00+02:00"},
+                        }
+                    }
+                return [
+                    {
+                        "productNumber": "SKU-NEW",
+                        "productName": "New product",
+                        "createDate": "2026-08-06T10:52:20.667+02:00",
+                        "warehouse": "WH1",
+                        "availableBalance": 2,
+                        "enabled": True,
+                    },
+                    {
+                        "productNumber": "SKU-NEW",
+                        "productName": "New product",
+                        "createDate": "2026-08-06T10:52:20.667+02:00",
+                        "warehouse": "WH2",
+                        "availableBalance": 3,
+                        "enabled": True,
+                    },
+                    {
+                        "productNumber": "SKU-OLD",
+                        "productName": "Old product",
+                        "createDate": "2026-08-05T11:59:59Z",
+                    },
+                    {
+                        "productNumber": "SKU-BAD-DATE",
+                        "productName": "Invalid date",
+                        "createDate": "not-a-date",
+                    },
+                ]
+
+        return Response()
+
+    stream = stream_module.ProductsCreatedStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+    stream.finalize_state_progress_markers()
+
+    assert len(records) == 1
+    assert records[0]["productNumber"] == "SKU-NEW"
+    assert records[0]["productHandlings"] == '["Standard"]'
+    assert records[0]["warehouse_stock"] == (
+        '[{"warehouse": "WH1", "availableBalance": 2}, '
+        '{"warehouse": "WH2", "availableBalance": 3}]'
+    )
+    assert calls == [
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products",
+            "params": {"pageCount": 100, "pageOffset": 0},
+        },
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products/SKU-NEW",
+            "params": {},
+        },
+    ]
+    assert stream.stream_state["replication_key"] == "createDate"
+    assert stream.stream_state["replication_key_value"] == "2026-08-06T12:00:00"
+
+
+def test_products_created_uses_bookmark_with_24_hour_overlap(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-08-07T12:00:00+00:00"
+        state = {
+            "bookmarks": {
+                "products_created": {
+                    "replication_key": "createDate",
+                    "replication_key_value": "2026-08-07T10:00:00Z",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    detail_products = []
+
+    def fake_request(url, params=None):
+        class Response:
+            def json(self):
+                if "/Products/" in url:
+                    detail_products.append(url.rsplit("/", 1)[-1])
+                    return {"productData": {}}
+                return [
+                    {
+                        "productNumber": "SKU-OVERLAP",
+                        "productName": "Overlap product",
+                        "createDate": "2026-08-06T10:00:00Z",
+                    },
+                    {
+                        "productNumber": "SKU-TOO-OLD",
+                        "productName": "Too old",
+                        "createDate": "2026-08-06T09:59:59Z",
+                    },
+                ]
+
+        return Response()
+
+    stream = stream_module.ProductsCreatedStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+    stream.finalize_state_progress_markers()
+
+    assert [record["productNumber"] for record in records] == ["SKU-OVERLAP"]
+    assert detail_products == ["SKU-OVERLAP"]
+    assert stream.stream_state["replication_key"] == "createDate"
+    assert stream.stream_state["replication_key_value"] == "2026-08-07T12:00:00"
 
 
 def test_customer_orders_first_run_skips_endpoint_and_seeds_bookmark(monkeypatch):
