@@ -1158,10 +1158,11 @@ class ProductsCreatedStream(ProductsStream):
     """Recover newly created products missed by Extend's modified-date filter.
 
     Every run scans the unfiltered Products list and groups warehouse rows by
-    productNumber before deciding what to retain. It keeps products created
-    between the previous successful run (with a 24-hour overlap) and the
-    current tap-run upper bound, plus products for which no warehouse row has
-    a valid createDate. Each retained product gets exactly one detail request.
+    productNumber before deciding what to retain. It keeps products when any
+    row has a valid createDate between the previous successful run (with a
+    24-hour overlap) and the current tap-run upper bound. Each retained product
+    gets exactly one detail request; products without a valid createDate are
+    skipped.
 
     This is a temporary workaround for Extend not reliably populating
     changedDate when a product is created.
@@ -1320,15 +1321,14 @@ class ProductsCreatedStream(ProductsStream):
             1 for product in products.values() if not product["has_valid_create_date"]
         )
         valid_out_of_window_products = len(products) - in_window_products - invalid_only_products
-        retained_products = in_window_products + invalid_only_products
+        retained_products = in_window_products
         logger.info(
             "ProductsCreated: scan done — %d rows / %d unique products; retaining %d "
-            "(%d in-window, %d with no valid createDate), excluding %d with valid "
-            "out-of-window dates; %d invalid createDate rows; window=%s..%s",
+            "in-window products, skipping %d with no valid createDate and %d with "
+            "valid out-of-window dates; %d invalid createDate rows; window=%s..%s",
             total_rows,
             len(products),
             retained_products,
-            in_window_products,
             invalid_only_products,
             valid_out_of_window_products,
             invalid_create_date_rows,
@@ -1338,15 +1338,10 @@ class ProductsCreatedStream(ProductsStream):
 
         enriched_products = 0
         for product_number, grouped_product in products.items():
-            if (
-                grouped_product["has_valid_create_date"]
-                and not grouped_product["is_in_window"]
-            ):
+            if not grouped_product["is_in_window"]:
                 continue
 
             record = grouped_product["record"]
-            if not grouped_product["has_valid_create_date"]:
-                record["createDate"] = None
             record.update(self._get_product_detail_fields(product_number))
             record["warehouse_stock"] = json.dumps(
                 grouped_product["warehouse_stock"]

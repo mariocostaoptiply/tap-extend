@@ -20,7 +20,7 @@ Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache
 | `SupplierAgreementsStream` | `GET /SupplierAgreement` | FULL_TABLE (active=true) |
 | `ProductSupplierAgreementsStream` | `GET /ProductSupplierAgreements` | INCREMENTAL child of `SupplierAgreementsStream` (first run unfiltered, later runs use `supplierAgreementNumber`, `changeDateFrom`, `changeDateTo`) |
 | `ProductsStream` | `GET /Products` | INCREMENTAL (first run unfiltered, later runs use `modifiedDateFrom` + `modifiedDateTo`) |
-| `ProductsCreatedStream` | `GET /Products` + `GET /Products/{productNumber}` | INCREMENTAL (groups warehouse rows by product; retains in-window products and products with no valid `createDate`; one detail request per retained product) |
+| `ProductsCreatedStream` | `GET /Products` + `GET /Products/{productNumber}` | INCREMENTAL (groups warehouse rows by product; retains products with any in-window `createDate`; one detail request per retained product) |
 | `ProductAvailabilityStream` | `GET /ProductAvailability` | INCREMENTAL (`modifiedDateFrom`) |
 | `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (used after `customer_orders` bookmark exists; fetches `CustomerOrders` + detail with `modifiedDateFrom` + `modifiedDateTo`) |
 | `PurchaseOrdersStream` | `GET /PurchaseOrders` | INCREMENTAL (`createDateFrom`) |
@@ -29,7 +29,7 @@ Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache
 
 All streams share a common `ExtendStream` base class that handles authentication, HTTP requests, and state management.
 
-`ProductsCreatedStream` is a temporary recovery stream for an Extend API defect where newly created products can be absent from the modified-date filtered `ProductsStream`. It scans the unfiltered list on every run and groups all warehouse rows by `productNumber`. A product is retained when any row has a `createDate` after the previous successful watermark minus 24 hours, or when none of its rows has a valid `createDate`. Retained products receive exactly one detail request.
+`ProductsCreatedStream` is a temporary recovery stream for an Extend API defect where newly created products can be absent from the modified-date filtered `ProductsStream`. It scans the unfiltered list on every run and groups all warehouse rows by `productNumber`. A product is retained when any row has a valid `createDate` after the previous successful watermark minus 24 hours. Products without a valid `createDate` are skipped, and each retained product receives exactly one detail request.
 
 ---
 
