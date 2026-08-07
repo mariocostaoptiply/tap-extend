@@ -1157,10 +1157,11 @@ class ProductsStream(ExtendStream):
 class ProductsCreatedStream(ProductsStream):
     """Recover newly created products missed by Extend's modified-date filter.
 
-    Every run scans the unfiltered Products list, then locally keeps products
-    created between the previous successful run (with a 24-hour overlap) and
-    the current tap-run upper bound. Product detail requests are only made for
-    retained products.
+    Every run scans the unfiltered Products list and groups warehouse rows by
+    productNumber before deciding what to retain. It keeps products created
+    between the previous successful run (with a 24-hour overlap) and the
+    current tap-run upper bound, plus products for which no warehouse row has
+    a valid createDate. Each retained product gets exactly one detail request.
 
     This is a temporary workaround for Extend not reliably populating
     changedDate when a product is created.
@@ -1238,12 +1239,12 @@ class ProductsCreatedStream(ProductsStream):
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         window_start, window_end = self._creation_window(context)
-        seen: dict[str, dict[str, Any]] = {}
-        stock_map: dict[str, list] = {}
+        products: dict[str, dict[str, Any]] = {}
         page_offset = 0
         page_count = 100
         total_rows = 0
-        invalid_create_dates = 0
+        invalid_create_date_rows = 0
+        in_window_products = 0
 
         while True:
             params: dict[str, Any] = {"pageCount": page_count, "pageOffset": page_offset}
@@ -1254,11 +1255,11 @@ class ProductsCreatedStream(ProductsStream):
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 400 and page_offset > 0:
                     logger.warning(
-                        "ProductsCreated: 400 at pageOffset=%d after %d rows / %d retained products. "
+                        "ProductsCreated: 400 at pageOffset=%d after %d rows / %d unique products. "
                         "Yielding partial results. Response: %s",
                         page_offset,
                         total_rows,
-                        len(seen),
+                        len(products),
                         exc.response.text[:500],
                     )
                     break
@@ -1269,26 +1270,37 @@ class ProductsCreatedStream(ProductsStream):
 
             total_rows += len(product_list)
             for product in product_list:
-                created_at = self._parse_create_date(product.get("createDate"))
-                if created_at is None:
-                    invalid_create_dates += 1
-                    continue
-                if created_at < window_start or created_at > window_end:
-                    continue
-
                 product_number = str(product.get("productNumber") or "")
                 if not product_number:
                     continue
 
-                stock_map.setdefault(product_number, []).append({
+                grouped_product = products.setdefault(
+                    product_number,
+                    {
+                        "record": self._map_list_record(product, product_number),
+                        "warehouse_stock": [],
+                        "has_valid_create_date": False,
+                        "is_in_window": False,
+                    },
+                )
+                grouped_product["warehouse_stock"].append({
                     "warehouse": product.get("warehouse") or "",
                     "availableBalance": product.get("availableBalance") or 0,
                 })
 
-                if product_number not in seen:
-                    record = self._map_list_record(product, product_number)
-                    record.update(self._get_product_detail_fields(product_number))
-                    seen[product_number] = record
+                created_at = self._parse_create_date(product.get("createDate"))
+                if created_at is None:
+                    invalid_create_date_rows += 1
+                    continue
+
+                grouped_product["has_valid_create_date"] = True
+                if window_start <= created_at <= window_end:
+                    if not grouped_product["is_in_window"]:
+                        in_window_products += 1
+                        grouped_product["record"] = self._map_list_record(
+                            product, product_number
+                        )
+                    grouped_product["is_in_window"] = True
 
             if len(product_list) < page_count:
                 break
@@ -1296,24 +1308,56 @@ class ProductsCreatedStream(ProductsStream):
 
             if page_offset % 50 == 0:
                 logger.info(
-                    "ProductsCreated: page %d — %d rows scanned, %d products retained",
+                    "ProductsCreated: page %d — %d rows scanned, %d unique products, "
+                    "%d in-window products",
                     page_offset,
                     total_rows,
-                    len(seen),
+                    len(products),
+                    in_window_products,
                 )
 
+        invalid_only_products = sum(
+            1 for product in products.values() if not product["has_valid_create_date"]
+        )
+        valid_out_of_window_products = len(products) - in_window_products - invalid_only_products
+        retained_products = in_window_products + invalid_only_products
         logger.info(
-            "ProductsCreated: done — %d rows scanned, %d products retained, "
-            "%d rows skipped with invalid createDate; window=%s..%s",
+            "ProductsCreated: scan done — %d rows / %d unique products; retaining %d "
+            "(%d in-window, %d with no valid createDate), excluding %d with valid "
+            "out-of-window dates; %d invalid createDate rows; window=%s..%s",
             total_rows,
-            len(seen),
-            invalid_create_dates,
+            len(products),
+            retained_products,
+            in_window_products,
+            invalid_only_products,
+            valid_out_of_window_products,
+            invalid_create_date_rows,
             window_start.isoformat(),
             window_end.isoformat(),
         )
 
-        for product_number, record in seen.items():
-            record["warehouse_stock"] = json.dumps(stock_map.get(product_number, []))
+        enriched_products = 0
+        for product_number, grouped_product in products.items():
+            if (
+                grouped_product["has_valid_create_date"]
+                and not grouped_product["is_in_window"]
+            ):
+                continue
+
+            record = grouped_product["record"]
+            if not grouped_product["has_valid_create_date"]:
+                record["createDate"] = None
+            record.update(self._get_product_detail_fields(product_number))
+            record["warehouse_stock"] = json.dumps(
+                grouped_product["warehouse_stock"]
+            )
+            enriched_products += 1
+            if enriched_products % 250 == 0:
+                logger.info(
+                    "ProductsCreated: enriched %d / %d retained products",
+                    enriched_products,
+                    retained_products,
+                )
             yield record
 
 

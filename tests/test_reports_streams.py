@@ -1449,7 +1449,7 @@ def test_products_subsequent_run_uses_bookmark_window(monkeypatch):
     assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
 
 
-def test_products_created_first_run_filters_before_detail_and_advances_state(monkeypatch):
+def test_products_created_groups_before_detail_and_falls_back_for_invalid_dates(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-08-06T12:00:00+00:00"
         state = {"bookmarks": {"products_created": {}}}
@@ -1475,7 +1475,17 @@ def test_products_created_first_run_filters_before_detail_and_advances_state(mon
                             "productDates": {"changedDate": "2026-08-06T10:55:00+02:00"},
                         }
                     }
+                if "/Products/" in url:
+                    return {"productData": {}}
                 return [
+                    {
+                        "productNumber": "SKU-NEW",
+                        "productName": "New product",
+                        "createDate": "not-a-date",
+                        "warehouse": "WH0",
+                        "availableBalance": 1,
+                        "enabled": True,
+                    },
                     {
                         "productNumber": "SKU-NEW",
                         "productName": "New product",
@@ -1501,6 +1511,19 @@ def test_products_created_first_run_filters_before_detail_and_advances_state(mon
                         "productNumber": "SKU-BAD-DATE",
                         "productName": "Invalid date",
                         "createDate": "not-a-date",
+                        "warehouse": "BAD1",
+                    },
+                    {
+                        "productNumber": "SKU-BAD-DATE",
+                        "productName": "Invalid date",
+                        "createDate": None,
+                        "warehouse": "BAD2",
+                    },
+                    {
+                        "productNumber": "SKU-BAD-DATE",
+                        "productName": "Invalid date",
+                        "createDate": "",
+                        "warehouse": "BAD3",
                     },
                 ]
 
@@ -1512,12 +1535,21 @@ def test_products_created_first_run_filters_before_detail_and_advances_state(mon
     records = list(stream.get_records())
     stream.finalize_state_progress_markers()
 
-    assert len(records) == 1
-    assert records[0]["productNumber"] == "SKU-NEW"
+    assert [record["productNumber"] for record in records] == [
+        "SKU-NEW",
+        "SKU-BAD-DATE",
+    ]
     assert records[0]["productHandlings"] == '["Standard"]'
     assert records[0]["warehouse_stock"] == (
-        '[{"warehouse": "WH1", "availableBalance": 2}, '
+        '[{"warehouse": "WH0", "availableBalance": 1}, '
+        '{"warehouse": "WH1", "availableBalance": 2}, '
         '{"warehouse": "WH2", "availableBalance": 3}]'
+    )
+    assert records[1]["createDate"] is None
+    assert records[1]["warehouse_stock"] == (
+        '[{"warehouse": "BAD1", "availableBalance": 0}, '
+        '{"warehouse": "BAD2", "availableBalance": 0}, '
+        '{"warehouse": "BAD3", "availableBalance": 0}]'
     )
     assert calls == [
         {
@@ -1526,6 +1558,10 @@ def test_products_created_first_run_filters_before_detail_and_advances_state(mon
         },
         {
             "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products/SKU-NEW",
+            "params": {},
+        },
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products/SKU-BAD-DATE",
             "params": {},
         },
     ]
