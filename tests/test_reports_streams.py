@@ -1452,7 +1452,7 @@ def test_products_subsequent_run_uses_bookmark_window(monkeypatch):
 def test_products_created_groups_before_detail_and_skips_invalid_only_products(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-08-06T12:00:00+00:00"
-        state = {"bookmarks": {"products_created": {}}}
+        state = {}
         config = {
             "api_url": "https://api.example.test/RESTAPI",
             "client": "TESTCLIENT",
@@ -1505,7 +1505,7 @@ def test_products_created_groups_before_detail_and_skips_invalid_only_products(m
                     {
                         "productNumber": "SKU-OLD",
                         "productName": "Old product",
-                        "createDate": "2026-08-05T11:59:59Z",
+                        "createDate": "2026-07-30T11:59:59Z",
                     },
                     {
                         "productNumber": "SKU-BAD-DATE",
@@ -1533,7 +1533,6 @@ def test_products_created_groups_before_detail_and_skips_invalid_only_products(m
     monkeypatch.setattr(stream, "_request", fake_request)
 
     records = list(stream.get_records())
-    stream.finalize_state_progress_markers()
 
     assert [record["productNumber"] for record in records] == ["SKU-NEW"]
     assert records[0]["productHandlings"] == '["Standard"]'
@@ -1552,11 +1551,12 @@ def test_products_created_groups_before_detail_and_skips_invalid_only_products(m
             "params": {},
         },
     ]
-    assert stream.stream_state["replication_key"] == "createDate"
-    assert stream.stream_state["replication_key_value"] == "2026-08-06T12:00:00"
+    assert stream.replication_key is None
+    assert stream.replication_method == "FULL_TABLE"
+    assert stream.stream_state == {}
 
 
-def test_products_created_uses_bookmark_with_24_hour_overlap(monkeypatch):
+def test_products_created_uses_fixed_seven_day_window_and_ignores_bookmark(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-08-07T12:00:00+00:00"
         state = {
@@ -1582,14 +1582,14 @@ def test_products_created_uses_bookmark_with_24_hour_overlap(monkeypatch):
                     return {"productData": {}}
                 return [
                     {
-                        "productNumber": "SKU-OVERLAP",
-                        "productName": "Overlap product",
-                        "createDate": "2026-08-06T10:00:00Z",
+                        "productNumber": "SKU-WINDOW-START",
+                        "productName": "Product at window start",
+                        "createDate": "2026-07-31T12:00:00Z",
                     },
                     {
                         "productNumber": "SKU-TOO-OLD",
                         "productName": "Too old",
-                        "createDate": "2026-08-06T09:59:59Z",
+                        "createDate": "2026-07-31T11:59:59Z",
                     },
                 ]
 
@@ -1599,12 +1599,11 @@ def test_products_created_uses_bookmark_with_24_hour_overlap(monkeypatch):
     monkeypatch.setattr(stream, "_request", fake_request)
 
     records = list(stream.get_records())
-    stream.finalize_state_progress_markers()
 
-    assert [record["productNumber"] for record in records] == ["SKU-OVERLAP"]
-    assert detail_products == ["SKU-OVERLAP"]
-    assert stream.stream_state["replication_key"] == "createDate"
-    assert stream.stream_state["replication_key_value"] == "2026-08-07T12:00:00"
+    assert [record["productNumber"] for record in records] == ["SKU-WINDOW-START"]
+    assert detail_products == ["SKU-WINDOW-START"]
+    assert stream.replication_key is None
+    assert stream.replication_method == "FULL_TABLE"
 
 
 def test_customer_orders_first_run_skips_endpoint_and_seeds_bookmark(monkeypatch):

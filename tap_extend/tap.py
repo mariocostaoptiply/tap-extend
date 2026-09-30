@@ -49,7 +49,7 @@ class TapExtend(Tap):
       - supplier_agreements           FULL_TABLE  GET /SupplierAgreement (active=true)
       - product_supplier_agreements   INCREMENTAL GET /ProductSupplierAgreements (child of supplier_agreements)
       - products                      INCREMENTAL GET /Products (first run unfiltered, then modifiedDateFrom/modifiedDateTo)
-      - products_created              INCREMENTAL GET /Products (unfiltered scan, local createDate window + detail)
+      - products_created              FULL_TABLE  GET /Products (unfiltered scan, rolling 7-day createDate window + detail)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
       - customer_orders               INCREMENTAL after bookmark exists via GET /CustomerOrders + detail (modifiedDateFrom/modifiedDateTo)
       - purchase_orders               INCREMENTAL GET /PurchaseOrders (createDateFrom)

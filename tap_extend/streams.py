@@ -5,7 +5,7 @@ Streams:
   - SupplierAgreementsStream:         GET /SupplierAgreement         (FULL_TABLE, active=true)
   - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (INCREMENTAL child of supplier_agreements)
   - ProductsStream:                   GET /Products                  (INCREMENTAL, first run unfiltered then modifiedDateFrom/modifiedDateTo)
-  - ProductsCreatedStream:            GET /Products + detail         (INCREMENTAL, unfiltered scan + local createDate window)
+  - ProductsCreatedStream:            GET /Products + detail         (FULL_TABLE, unfiltered scan + rolling 7-day createDate window)
   - ProductAvailabilityStream:        GET /ProductAvailability       (INCREMENTAL, modifiedDateFrom)
   - CustomerOrdersStream:             first run via reports, then GET /CustomerOrders + detail
   - PurchaseOrdersStream:             GET /PurchaseOrders            (INCREMENTAL, createDateFrom)
@@ -59,7 +59,6 @@ logger = logging.getLogger(__name__)
 _SIGNPOST_BOOKMARK_STREAMS = {
     "product_supplier_agreements": "changeDate",
     "products": "modifiedDate",
-    "products_created": "createDate",
     "customer_orders": "changeDate",
 }
 
@@ -1159,19 +1158,18 @@ class ProductsCreatedStream(ProductsStream):
 
     Every run scans the unfiltered Products list and groups warehouse rows by
     productNumber before deciding what to retain. It keeps products when any
-    row has a valid createDate between the previous successful run (with a
-    24-hour overlap) and the current tap-run upper bound. Each retained product
-    gets exactly one detail request; products without a valid createDate are
-    skipped.
+    row has a valid createDate in the seven days before the current tap-run
+    upper bound. Each retained product gets exactly one detail request;
+    products without a valid createDate are skipped.
 
     This is a temporary workaround for Extend not reliably populating
     changedDate when a product is created.
     """
 
     name = "products_created"
-    replication_key = "createDate"
-    replication_method = "INCREMENTAL"
-    overlap = timedelta(hours=24)
+    replication_key = None
+    replication_method = "FULL_TABLE"
+    creation_window = timedelta(days=7)
 
     @staticmethod
     def _parse_create_date(value: Any) -> Optional[datetime]:
@@ -1191,25 +1189,20 @@ class ProductsCreatedStream(ProductsStream):
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    def _creation_window(self, context: Optional[dict]) -> tuple[datetime, datetime]:
+    def _creation_window(self) -> tuple[datetime, datetime]:
         upper_bound = self._parse_create_date(self.sync_upper_bound)
         if upper_bound is None:  # pragma: no cover - sync_upper_bound is generated internally
             raise ValueError(f"Invalid products_created upper bound: {self.sync_upper_bound}")
 
-        current_state = self.get_context_state(context)
-        bookmark = None
-        if current_state.get("replication_key") == self.replication_key:
-            bookmark = self._parse_create_date(current_state.get("replication_key_value"))
+        return upper_bound - self.creation_window, upper_bound
 
-        if bookmark is not None and bookmark > upper_bound:
-            logger.warning(
-                "ProductsCreated: bookmark %s is after run upper bound %s; using upper bound.",
-                bookmark.isoformat(),
-                upper_bound.isoformat(),
-            )
-            bookmark = upper_bound
+    def get_replication_key_signpost(self, context: Optional[dict]) -> None:
+        """Disable the incremental signpost inherited from ProductsStream."""
+        return None
 
-        return (bookmark or upper_bound) - self.overlap, upper_bound
+    def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None:
+        """Do not persist replication state for this rolling-window stream."""
+        return None
 
     @staticmethod
     def _map_list_record(product: dict[str, Any], product_number: str) -> dict[str, Any]:
@@ -1239,7 +1232,7 @@ class ProductsCreatedStream(ProductsStream):
         }
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        window_start, window_end = self._creation_window(context)
+        window_start, window_end = self._creation_window()
         products: dict[str, dict[str, Any]] = {}
         page_offset = 0
         page_count = 100
