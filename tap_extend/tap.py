@@ -52,7 +52,7 @@ class TapExtend(Tap):
       - products_created              FULL_TABLE  GET /Products (unfiltered scan, rolling 7-day createDate window + detail)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
       - customer_orders               INCREMENTAL after bookmark exists via GET /CustomerOrders + detail (modifiedDateFrom/modifiedDateTo)
-      - purchase_orders               INCREMENTAL GET /PurchaseOrders (createDateFrom)
+      - purchase_orders               INCREMENTAL GET /PurchaseOrders (changeDateFrom/changeDateTo)
       - reports_order_headers         INCREMENTAL historical-only GET /reports/{client}/OrderHeaders (changeDate day-by-day)
       - reports_order_rows            INCREMENTAL historical-only GET /reports/{client}/OrderRows    (changeDate day-by-day)
     """

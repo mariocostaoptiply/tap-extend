@@ -782,13 +782,23 @@ def test_sanitize_signpost_bookmark_state_uses_progress_marker_when_no_signpost(
     }
 
 
-def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
+@pytest.mark.parametrize(
+    "bookmark,start_date,expected_from",
+    [
+        (None, "2026-04-20T00:00:00Z", "2026-04-20T00:00:00"),
+        ("2026-04-20T16:00:00Z", "2026-04-20T00:00:00Z", "2026-04-20T16:00:00"),
+        (None, None, "2026-04-20T17:18:46"),
+    ],
+)
+def test_purchase_orders_uses_change_date_datetime_range(
+    monkeypatch, bookmark, start_date, expected_from
+):
     class Tap:
         _extend_sync_upper_bound = "2026-04-20T17:18:46+00:00"
         config = {
             "api_url": "https://api.example.test/RESTAPI",
             "client": "TESTCLIENT",
-            "start_date": "2026-04-20T00:00:00Z",
+            "start_date": start_date,
         }
         warehouse_codes = None
 
@@ -807,14 +817,18 @@ def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
         return Response()
 
     stream = stream_module.PurchaseOrdersStream(tap=Tap())
+    if bookmark is not None:
+        stream.stream_state.update(
+            replication_key="changeDate", replication_key_value=bookmark
+        )
     monkeypatch.setattr(stream, "_request", fake_request)
 
     assert list(stream.get_records()) == []
     assert captured == [{
         "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/PurchaseOrders",
         "params": {
-            "changeDateFrom": "2026-04-20T00:00:00",
-            "changeDateTo": "2026-04-21T17:18:46",
+            "changeDateFrom": expected_from,
+            "changeDateTo": "2026-04-20T17:18:46",
             "pageNumber": 1,
         },
     }]

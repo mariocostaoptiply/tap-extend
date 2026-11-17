@@ -23,13 +23,15 @@ Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache
 | `ProductsCreatedStream` | `GET /Products` + `GET /Products/{productNumber}` | FULL_TABLE (unfiltered scan with a rolling seven-day local `createDate` window; no replication key) |
 | `ProductAvailabilityStream` | `GET /ProductAvailability` | INCREMENTAL (`modifiedDateFrom`) |
 | `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (used after `customer_orders` bookmark exists; fetches `CustomerOrders` + detail with `modifiedDateFrom` + `modifiedDateTo`) |
-| `PurchaseOrdersStream` | `GET /PurchaseOrders` | INCREMENTAL (`createDateFrom`) |
+| `PurchaseOrdersStream` | `GET /PurchaseOrders` | INCREMENTAL (`changeDateFrom` + `changeDateTo`) |
 | `ReportsOrderHeadersStream` | `GET /reports/{client}/OrderHeaders` | INCREMENTAL (day-by-day `changeDate`) |
 | `ReportsOrderRowsStream` | `GET /reports/{client}/OrderRows` | INCREMENTAL (day-by-day `changeDate`) |
 
 All streams share a common `ExtendStream` base class that handles authentication, HTTP requests, and state management.
 
 `ProductsCreatedStream` is a temporary recovery stream for an Extend API defect where newly created products can be absent from the modified-date filtered `ProductsStream`. It scans the unfiltered list on every run and groups all warehouse rows by `productNumber`. A product is retained when any row has a valid `createDate` within the seven days before the job's fixed upper-bound timestamp. Products without a valid `createDate` are skipped, and each retained product receives exactly one detail request. The stream does not use or persist a replication key.
+
+Purchase orders use the saved `changeDate` bookmark, falling back to `start_date`, as `changeDateFrom`. The `changeDateTo` upper bound is the fixed tap-run timestamp, without a next-day extension.
 
 ---
 
